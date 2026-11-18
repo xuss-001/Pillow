@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from PIL import Image
@@ -179,3 +181,156 @@ def test_small_palette() -> None:
     quantized_colors = im.getcolors()
     assert quantized_colors is not None
     assert len(quantized_colors) == 2
+
+
+def test_quantize_rgba_palette(tmp_path: Path) -> None:
+    palette_data = [
+        10,
+        20,
+        30,
+        255,
+        200,
+        0,
+        0,
+        128,
+        200,
+        0,
+        0,
+        255,
+        50,
+        60,
+        70,
+        0,
+        90,
+        80,
+        70,
+        0,
+    ]
+    palette = Image.new("P", (1, 1))
+    palette.putpalette(palette_data, "RGBA")
+    palette_copy = palette.copy()
+
+    image = Image.new("RGBA", (6, 1))
+    image.putdata(
+        [
+            (0, 0, 0, 0),
+            (200, 0, 0, 128),
+            (200, 0, 0, 255),
+            (10, 20, 30, 255),
+            (255, 255, 255, 0),
+            (5, 0, 0, 255),
+        ]
+    )
+    image_copy = image.copy()
+
+    quantized = image.quantize(dither=Image.Dither.NONE, palette=palette)
+
+    assert list(quantized.get_flattened_data()) == [3, 1, 2, 0, 3, 0]
+    assert quantized.getpalette("RGBA") == palette_data
+    assert list(quantized.convert("RGBA").get_flattened_data()) == [
+        (50, 60, 70, 0),
+        (200, 0, 0, 128),
+        (200, 0, 0, 255),
+        (10, 20, 30, 255),
+        (50, 60, 70, 0),
+        (10, 20, 30, 255),
+    ]
+
+    assert image.tobytes() == image_copy.tobytes()
+    assert palette.getpalette("RGBA") == palette_copy.getpalette("RGBA")
+    assert palette.info == palette_copy.info
+
+    out = tmp_path / "rgba_palette.png"
+    quantized.save(out)
+    with Image.open(out) as reloaded:
+        assert reloaded.mode == "P"
+        assert reloaded.info["transparency"] == bytes([255, 128, 255, 0, 0])
+        assert list(reloaded.convert("RGBA").get_flattened_data()) == list(
+            quantized.convert("RGBA").get_flattened_data()
+        )
+
+
+def test_quantize_rgba_palette_distance_tie() -> None:
+    palette = Image.new("P", (1, 1))
+    palette.putpalette([0, 0, 0, 255, 10, 0, 0, 255], "RGBA")
+    image = Image.new("RGBA", (1, 1), (5, 0, 0, 255))
+
+    quantized = image.quantize(dither=Image.Dither.NONE, palette=palette)
+
+    assert quantized.getpixel((0, 0)) == 0
+
+
+@pytest.mark.parametrize(
+    "transparency,expected_indices,expected_palette",
+    (
+        (2, [2, 1], [0, 0, 0, 255, 255, 0, 0, 255, 128, 128, 128, 0]),
+        (
+            bytes([255, 64, 0]),
+            [2, 1, 2],
+            [0, 0, 0, 255, 255, 0, 0, 64, 128, 128, 128, 0],
+        ),
+    ),
+)
+def test_quantize_rgba_palette_transparency(
+    tmp_path: Path,
+    transparency: int | bytes,
+    expected_indices: list[int],
+    expected_palette: list[int],
+) -> None:
+    palette = Image.new("P", (1, 1))
+    palette.putpalette([0, 0, 0, 255, 0, 0, 128, 128, 128])
+    palette.info["transparency"] = transparency
+    palette_copy = palette.copy()
+
+    image = Image.new("RGBA", (3 if isinstance(transparency, bytes) else 2, 1))
+    image.putdata(
+        [(0, 0, 0, 0), (255, 0, 0, 64), (255, 255, 255, 0)]
+        if isinstance(transparency, bytes)
+        else [(0, 0, 0, 0), (255, 0, 0, 255)]
+    )
+
+    quantized = image.quantize(dither=Image.Dither.NONE, palette=palette)
+
+    assert list(quantized.get_flattened_data()) == expected_indices
+    assert quantized.getpalette("RGBA") == expected_palette
+    assert quantized.info["transparency"] == transparency
+    assert palette.getpalette("RGBA") == palette_copy.getpalette("RGBA")
+    assert palette.info == palette_copy.info
+
+    out = tmp_path / "transparency.png"
+    quantized.save(out)
+    with Image.open(out) as reloaded:
+        assert reloaded.mode == "P"
+        assert reloaded.info["transparency"] == transparency
+        assert list(reloaded.convert("RGBA").get_flattened_data()) == list(
+            quantized.convert("RGBA").get_flattened_data()
+        )
+
+
+def test_quantize_rgba_palette_dither() -> None:
+    palette = Image.new("P", (1, 1))
+    palette.putpalette(
+        [0, 0, 0, 255, 255, 255, 255, 255, 1, 2, 3, 0],
+        "RGBA",
+    )
+    image = Image.new("RGBA", (3, 1))
+    image.putdata(
+        [(180, 180, 180, 255), (255, 255, 255, 0), (127, 127, 127, 255)]
+    )
+
+    quantized = image.quantize(dither=Image.Dither.FLOYDSTEINBERG, palette=palette)
+
+    assert list(quantized.get_flattened_data()) == [1, 2, 0]
+    assert quantized.convert("RGBA").getpixel((1, 0)) == (1, 2, 3, 0)
+
+
+def test_quantize_rgba_invalid_palette() -> None:
+    image = Image.new("RGBA", (1, 1))
+
+    with pytest.raises(ValueError, match="bad mode for palette image"):
+        image.quantize(palette=hopper("RGB"))
+
+    palette = Image.new("P", (1, 1))
+    palette.putpalette([0, 0, 0, 0], "CMYK")
+    with pytest.raises(ValueError, match="only RGB or RGBA palettes"):
+        image.quantize(palette=palette)

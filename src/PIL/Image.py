@@ -1297,8 +1297,15 @@ class Image:
                        and :data:`Quantize.MAXCOVERAGE` do not support RGBA images, so
                        :data:`Quantize.FASTOCTREE` is used by default instead.
         :param kmeans: Integer greater than or equal to zero.
-        :param palette: Quantize to the palette of given
-                        :py:class:`PIL.Image.Image`.
+        :param palette: Quantize to the palette of a given P mode
+                        :py:class:`PIL.Image.Image`. The palette may contain
+                        RGB or RGBA entries. For RGBA source images, palette
+                        entries are selected using an equal-weight RGBA
+                        distance, including RGBA palette entries and any
+                        transparency metadata on the reference image. When
+                        dithering, only RGB error is diffused. Fully
+                        transparent source pixels select the first fully
+                        transparent palette entry, if one exists.
         :param dither: Dithering method, used when converting from
            mode "RGB" to "P" or from "RGB" or "L" to "1".
            Available methods are :data:`Dither.NONE` or :data:`Dither.FLOYDSTEINBERG`
@@ -1314,6 +1321,57 @@ class Image:
             if self.mode == "RGBA":
                 method = Quantize.FASTOCTREE
 
+        if palette:
+            # use palette from reference image
+            palette.load()
+            if palette.mode != "P":
+                msg = "bad mode for palette image"
+                raise ValueError(msg)
+            if self.mode not in {"RGB", "L", "RGBA"}:
+                msg = "only RGB, L or RGBA mode images can be quantized to a palette"
+                raise ValueError(msg)
+
+            palette_image = palette
+            if self.mode == "RGBA":
+                palette_mode = palette.im.getpalettemode()
+                if palette_mode not in {"RGB", "RGBA"}:
+                    msg = "only RGB or RGBA palettes can be used with RGBA images"
+                    raise ValueError(msg)
+
+                transparency = palette.info.get("transparency")
+                if transparency is not None:
+                    palette_data = palette.getpalette("RGBA")
+                    if not palette_data:
+                        msg = "empty palette"
+                        raise ValueError(msg)
+
+                    if isinstance(transparency, int):
+                        if not 0 <= transparency < len(palette_data) // 4:
+                            msg = "transparency index is out of range"
+                            raise ValueError(msg)
+                        palette_data[transparency * 4 + 3] = 0
+                    elif isinstance(transparency, (bytes, bytearray)):
+                        for index, alpha in enumerate(transparency):
+                            if index * 4 >= len(palette_data):
+                                break
+                            palette_data[index * 4 + 3] = alpha
+                    else:
+                        msg = "transparency for P mode should be bytes or int"
+                        raise ValueError(msg)
+
+                    palette_image = new("P", (1, 1))
+                    palette_image.putpalette(palette_data, "RGBA")
+
+            im = self.im.convert("P", dither, palette_image.im)
+            new_im = self._new(im)
+            assert palette.palette is not None
+            new_im.palette = palette.palette.copy()
+            if self.mode == "RGBA":
+                new_im.info.pop("transparency", None)
+                if "transparency" in palette.info:
+                    new_im.info["transparency"] = palette.info["transparency"]
+            return new_im
+
         if self.mode == "RGBA" and method not in (
             Quantize.FASTOCTREE,
             Quantize.LIBIMAGEQUANT,
@@ -1324,21 +1382,6 @@ class Image:
                 "are the only valid methods for quantizing RGBA images"
             )
             raise ValueError(msg)
-
-        if palette:
-            # use palette from reference image
-            palette.load()
-            if palette.mode != "P":
-                msg = "bad mode for palette image"
-                raise ValueError(msg)
-            if self.mode not in {"RGB", "L"}:
-                msg = "only RGB or L mode images can be quantized to a palette"
-                raise ValueError(msg)
-            im = self.im.convert("P", dither, palette.im)
-            new_im = self._new(im)
-            assert palette.palette is not None
-            new_im.palette = palette.palette.copy()
-            return new_im
 
         if kmeans < 0:
             msg = "kmeans must not be negative"

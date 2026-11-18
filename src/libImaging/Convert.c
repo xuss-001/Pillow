@@ -1158,6 +1158,140 @@ frompalette(Imaging imOut, Imaging imIn, const ModeID mode) {
 #if defined(_MSC_VER)
 #pragma optimize("", off)
 #endif
+
+static int
+nearest_palette_index(ImagingPalette palette, int r, int g, int b, int a) {
+    int best_distance = -1;
+    int best_index = 0;
+    const int has_alpha = palette->mode == IMAGING_MODE_RGBA;
+
+    if (a == 0 && has_alpha) {
+        for (int i = 0; i < palette->size; i++) {
+            if (palette->palette[i * 4 + 3] == 0) {
+                return i;
+            }
+        }
+    }
+
+    for (int i = 0; i < palette->size; i++) {
+        const int dr = r - palette->palette[i * 4];
+        const int dg = g - palette->palette[i * 4 + 1];
+        const int db = b - palette->palette[i * 4 + 2];
+        const int da = a - (has_alpha ? palette->palette[i * 4 + 3] : 255);
+        const int distance = dr * dr + dg * dg + db * db + da * da;
+
+        if (best_distance < 0 || distance < best_distance) {
+            best_distance = distance;
+            best_index = i;
+        }
+    }
+
+    return best_index;
+}
+
+static Imaging
+topalette_rgba(
+    Imaging imOut,
+    Imaging imIn,
+    const ModeID mode,
+    ImagingPalette palette,
+    int dither
+) {
+    ImagingSectionCookie cookie;
+    const int alpha = mode == IMAGING_MODE_PA;
+    const int error_count = (imIn->xsize + 2) * 3;
+    int *errors = NULL;
+    int *next_errors = NULL;
+    int x, y;
+
+    if (palette->size <= 0) {
+        return (Imaging)ImagingError_ValueError("empty palette");
+    }
+
+    imOut = ImagingNew2Dirty(mode, imOut, imIn);
+    if (!imOut) {
+        return NULL;
+    }
+
+    ImagingPaletteDelete(imOut->palette);
+    imOut->palette = ImagingPaletteDuplicate(palette);
+
+    if (dither) {
+        errors = calloc(error_count, sizeof(int));
+        next_errors = calloc(error_count, sizeof(int));
+        if (!errors || !next_errors) {
+            free(errors);
+            free(next_errors);
+            ImagingDelete(imOut);
+            return ImagingError_MemoryError();
+        }
+    }
+
+    ImagingSectionEnter(&cookie);
+    for (y = 0; y < imIn->ysize; y++) {
+        const UINT8 *in = (const UINT8 *)imIn->image[y];
+        UINT8 *out = alpha ? (UINT8 *)imOut->image32[y] : imOut->image8[y];
+
+        for (x = 0; x < imIn->xsize; x++, in += 4) {
+            int r = in[0];
+            int g = in[1];
+            int b = in[2];
+            const int a = in[3];
+
+            if (dither && a != 0) {
+                r = CLIP8(r + errors[(x + 1) * 3]);
+                g = CLIP8(g + errors[(x + 1) * 3 + 1]);
+                b = CLIP8(b + errors[(x + 1) * 3 + 2]);
+            }
+
+            const int index = nearest_palette_index(palette, r, g, b, a);
+            if (alpha) {
+                out[x * 4] = out[x * 4 + 1] = out[x * 4 + 2] = (UINT8)index;
+                out[x * 4 + 3] =
+                    palette->mode == IMAGING_MODE_RGBA
+                        ? palette->palette[index * 4 + 3]
+                        : 255;
+            } else {
+                out[x] = (UINT8)index;
+            }
+
+            if (dither && a != 0) {
+                const int er = r - palette->palette[index * 4];
+                const int eg = g - palette->palette[index * 4 + 1];
+                const int eb = b - palette->palette[index * 4 + 2];
+
+                errors[(x + 2) * 3] += er * 7 / 16;
+                next_errors[x * 3] += er * 3 / 16;
+                next_errors[(x + 1) * 3] += er * 5 / 16;
+                next_errors[(x + 2) * 3] += er / 16;
+
+                errors[(x + 2) * 3 + 1] += eg * 7 / 16;
+                next_errors[x * 3 + 1] += eg * 3 / 16;
+                next_errors[(x + 1) * 3 + 1] += eg * 5 / 16;
+                next_errors[(x + 2) * 3 + 1] += eg / 16;
+
+                errors[(x + 2) * 3 + 2] += eb * 7 / 16;
+                next_errors[x * 3 + 2] += eb * 3 / 16;
+                next_errors[(x + 1) * 3 + 2] += eb * 5 / 16;
+                next_errors[(x + 2) * 3 + 2] += eb / 16;
+            }
+        }
+
+        if (dither) {
+            int *temp = errors;
+            errors = next_errors;
+            next_errors = temp;
+            memset(next_errors, 0, error_count * sizeof(int));
+        }
+    }
+    ImagingSectionLeave(&cookie);
+
+    free(errors);
+    free(next_errors);
+
+    return imOut;
+}
+
 static Imaging
 topalette(
     Imaging imOut, Imaging imIn, const ModeID mode, ImagingPalette inpalette, int dither
@@ -1194,6 +1328,14 @@ topalette(
 
     if (!palette) {
         return (Imaging)ImagingError_ValueError("no palette");
+    }
+
+    if (imIn->mode == IMAGING_MODE_RGBA) {
+        Imaging result = topalette_rgba(imOut, imIn, mode, palette, dither);
+        if (palette != inpalette) {
+            ImagingPaletteDelete(palette);
+        }
+        return result;
     }
 
     imOut = ImagingNew2Dirty(mode, imOut, imIn);
