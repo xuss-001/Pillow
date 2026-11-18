@@ -1158,6 +1158,136 @@ frompalette(Imaging imOut, Imaging imIn, const ModeID mode) {
 #if defined(_MSC_VER)
 #pragma optimize("", off)
 #endif
+
+static int
+nearest_rgba_color(ImagingPalette palette, int r, int g, int b, int a) {
+    int i;
+    int nearest = 0;
+    unsigned int nearest_distance = (unsigned int)~0;
+
+    if (a == 0) {
+        for (i = 0; i < palette->size; i++) {
+            if (palette->palette[i * 4 + 3] == 0) {
+                return i;
+            }
+        }
+    }
+
+    for (i = 0; i < palette->size; i++) {
+        int dr = r - palette->palette[i * 4 + 0];
+        int dg = g - palette->palette[i * 4 + 1];
+        int db = b - palette->palette[i * 4 + 2];
+        int da = a - palette->palette[i * 4 + 3];
+        unsigned int distance =
+            (unsigned int)(dr * dr + dg * dg + db * db + da * da);
+
+        if (distance < nearest_distance) {
+            nearest_distance = distance;
+            nearest = i;
+        }
+    }
+
+    return nearest;
+}
+
+static void
+set_rgba_palette_pixel(
+    UINT8 *out, int x, int index, int alpha, ImagingPalette palette
+) {
+    if (alpha) {
+        out[x * 4] = (UINT8)index;
+        out[x * 4 + 1] = 0;
+        out[x * 4 + 2] = 0;
+        out[x * 4 + 3] = palette->palette[index * 4 + 3];
+    } else {
+        out[x] = (UINT8)index;
+    }
+}
+
+static int
+topalette_rgba(
+    Imaging imOut, Imaging imIn, ImagingPalette palette, int dither, int alpha
+) {
+    int x, y;
+
+    if (!dither) {
+        for (y = 0; y < imIn->ysize; y++) {
+            UINT8 *in = (UINT8 *)imIn->image[y];
+            UINT8 *out = alpha ? (UINT8 *)imOut->image32[y] : imOut->image8[y];
+
+            for (x = 0; x < imIn->xsize; x++) {
+                int index = nearest_rgba_color(
+                    palette, in[x * 4], in[x * 4 + 1], in[x * 4 + 2], in[x * 4 + 3]
+                );
+                set_rgba_palette_pixel(out, x, index, alpha, palette);
+            }
+        }
+        return 0;
+    }
+
+    const int error_stride = (imIn->xsize + 2) * 3;
+    int *errors = calloc(error_stride, sizeof(int));
+    int *next_errors = calloc(error_stride, sizeof(int));
+    if (!errors || !next_errors) {
+        free(errors);
+        free(next_errors);
+        return -1;
+    }
+
+    for (y = 0; y < imIn->ysize; y++) {
+        UINT8 *in = (UINT8 *)imIn->image[y];
+        UINT8 *out = alpha ? (UINT8 *)imOut->image32[y] : imOut->image8[y];
+
+        for (x = 0; x < imIn->xsize; x++) {
+            int r = CLIP8(in[x * 4] + errors[(x + 1) * 3] / 16);
+            int g = CLIP8(in[x * 4 + 1] + errors[(x + 1) * 3 + 1] / 16);
+            int b = CLIP8(in[x * 4 + 2] + errors[(x + 1) * 3 + 2] / 16);
+            int a = in[x * 4 + 3];
+            int index = nearest_rgba_color(palette, r, g, b, a);
+            set_rgba_palette_pixel(out, x, index, alpha, palette);
+
+            if (a == 0) {
+                continue;
+            }
+
+            int er = r - palette->palette[index * 4 + 0];
+            int eg = g - palette->palette[index * 4 + 1];
+            int eb = b - palette->palette[index * 4 + 2];
+
+            if (x + 1 < imIn->xsize) {
+                errors[(x + 2) * 3] += er * 7;
+                errors[(x + 2) * 3 + 1] += eg * 7;
+                errors[(x + 2) * 3 + 2] += eb * 7;
+            }
+
+            if (y + 1 < imIn->ysize) {
+                if (x > 0) {
+                    next_errors[x * 3] += er * 3;
+                    next_errors[x * 3 + 1] += eg * 3;
+                    next_errors[x * 3 + 2] += eb * 3;
+                }
+                next_errors[(x + 1) * 3] += er * 5;
+                next_errors[(x + 1) * 3 + 1] += eg * 5;
+                next_errors[(x + 1) * 3 + 2] += eb * 5;
+                if (x + 1 < imIn->xsize) {
+                    next_errors[(x + 2) * 3] += er;
+                    next_errors[(x + 2) * 3 + 1] += eg;
+                    next_errors[(x + 2) * 3 + 2] += eb;
+                }
+            }
+        }
+
+        int *tmp = errors;
+        errors = next_errors;
+        next_errors = tmp;
+        memset(next_errors, 0, error_stride * sizeof(int));
+    }
+
+    free(errors);
+    free(next_errors);
+    return 0;
+}
+
 static Imaging
 topalette(
     Imaging imOut, Imaging imIn, const ModeID mode, ImagingPalette inpalette, int dither
@@ -1221,6 +1351,18 @@ topalette(
         }
         ImagingSectionLeave(&cookie);
 
+    } else if (imIn->mode == IMAGING_MODE_RGBA && inpalette != NULL) {
+        int result;
+        ImagingSectionEnter(&cookie);
+        result = topalette_rgba(imOut, imIn, palette, dither, alpha);
+        ImagingSectionLeave(&cookie);
+        if (result < 0) {
+            ImagingDelete(imOut);
+            if (palette != inpalette) {
+                ImagingPaletteDelete(palette);
+            }
+            return (Imaging)ImagingError_MemoryError();
+        }
     } else {
         /* colour image */
 

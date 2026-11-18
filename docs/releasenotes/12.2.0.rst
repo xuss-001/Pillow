@@ -101,6 +101,15 @@ EXIF tag FrameRate
 
 The EXIF tag ``FrameRate`` has been added.
 
+RGBA images with fixed palettes in Image.quantize
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+:py:meth:`.Image.Image.quantize` can now map RGBA images to a P mode reference
+image. The reference palette's colors and alpha values, including transparency
+metadata, are preserved in the output palette. Colors are selected by their
+RGBA distance. With Floyd-Steinberg dithering, only RGB error is diffused, and
+fully transparent source pixels do not diffuse their hidden colors.
+
 Other changes
 =============
 

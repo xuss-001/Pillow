@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from io import BytesIO
+
 import pytest
 
 from PIL import Image
@@ -92,6 +94,200 @@ def test_quantize_no_dither2() -> None:
     assert px is not None
     for x in range(9):
         assert px[x, 0] == (0 if x < 5 else 1)
+
+
+def test_quantize_rgba_palette_no_dither() -> None:
+    palette_data = (
+        255,
+        0,
+        0,
+        0,
+        0,
+        0,
+        255,
+        0,
+        255,
+        0,
+        0,
+        128,
+        255,
+        0,
+        0,
+        255,
+    )
+    palette = Image.new("P", (1, 1))
+    palette.putpalette(palette_data, "RGBA")
+    palette_info = palette.info.copy()
+
+    source = Image.new("RGBA", (5, 1))
+    source.putdata(
+        [
+            (0, 0, 255, 0),
+            (254, 1, 1, 127),
+            (254, 1, 1, 200),
+            (255, 0, 0, 64),
+            (255, 0, 0, 0),
+        ]
+    )
+    source_bytes = source.tobytes()
+
+    converted = source.quantize(dither=Image.Dither.NONE, palette=palette)
+
+    assert list(converted.get_flattened_data()) == [0, 2, 3, 0, 0]
+    assert converted.palette is not None
+    assert converted.palette.mode == "RGBA"
+    assert converted.getpalette("RGBA") == list(palette_data)
+    assert list(converted.convert("RGBA").get_flattened_data()) == [
+        (255, 0, 0, 0),
+        (255, 0, 0, 128),
+        (255, 0, 0, 255),
+        (255, 0, 0, 0),
+        (255, 0, 0, 0),
+    ]
+
+    assert source.tobytes() == source_bytes
+    assert palette.info == palette_info
+    assert palette.palette is not None
+    assert palette.palette.mode == "RGBA"
+    assert palette.getpalette("RGBA") == list(palette_data)
+
+
+@pytest.mark.parametrize(
+    "transparency, source_alpha, expected_alpha",
+    (
+        (1, (255, 0, 255), (255, 0, 255)),
+        (bytes((0, 128, 255)), (0, 128, 255), (0, 128, 255)),
+    ),
+)
+def test_quantize_rgba_palette_transparency_metadata(
+    transparency: int | bytes,
+    source_alpha: tuple[int, int, int],
+    expected_alpha: tuple[int, int, int],
+) -> None:
+    palette = Image.new("P", (1, 1))
+    palette.putpalette((255, 0, 0, 0, 255, 0, 0, 0, 255))
+    palette.info["transparency"] = transparency
+    palette_info = palette.info.copy()
+
+    source = Image.new("RGBA", (3, 1))
+    source.putdata(
+        [
+            (255, 0, 0, source_alpha[0]),
+            (0, 255, 0, source_alpha[1]),
+            (0, 0, 255, source_alpha[2]),
+        ]
+    )
+
+    converted = source.quantize(dither=Image.Dither.NONE, palette=palette)
+
+    assert list(converted.get_flattened_data()) == [0, 1, 2]
+    assert converted.getpalette("RGBA") == [
+        255,
+        0,
+        0,
+        expected_alpha[0],
+        0,
+        255,
+        0,
+        expected_alpha[1],
+        0,
+        0,
+        255,
+        expected_alpha[2],
+    ]
+
+    assert palette.info == palette_info
+    assert palette.palette is not None
+    assert palette.palette.mode == "RGB"
+    assert palette.getpalette("RGBA") == [
+        255,
+        0,
+        0,
+        255,
+        0,
+        255,
+        0,
+        255,
+        0,
+        0,
+        255,
+        255,
+    ]
+
+
+def test_quantize_rgba_palette_without_transparent_color() -> None:
+    palette = Image.new("P", (1, 1))
+    palette.putpalette((0, 0, 0, 255, 255, 255, 255, 255), "RGBA")
+    source = Image.new("RGBA", (1, 1), (250, 250, 250, 0))
+
+    converted = source.quantize(dither=Image.Dither.NONE, palette=palette)
+
+    assert list(converted.get_flattened_data()) == [1]
+    assert list(converted.convert("RGBA").get_flattened_data()) == [
+        (255, 255, 255, 255)
+    ]
+
+
+def test_quantize_rgba_palette_dither() -> None:
+    palette = Image.new("P", (1, 1))
+    palette.putpalette(
+        (0, 0, 0, 0, 0, 0, 0, 255, 255, 255, 255, 255), "RGBA"
+    )
+
+    for hidden_red in (0, 200, 255):
+        source = Image.new("RGBA", (2, 1))
+        source.putdata([(hidden_red, 0, 0, 0), (100, 0, 0, 255)])
+        converted = source.quantize(
+            dither=Image.Dither.FLOYDSTEINBERG, palette=palette
+        )
+        assert list(converted.get_flattened_data()) == [0, 1]
+
+    source = Image.new("RGBA", (12, 1), (100, 100, 100, 255))
+    no_dither = source.quantize(dither=Image.Dither.NONE, palette=palette)
+    dithered = source.quantize(dither=Image.Dither.FLOYDSTEINBERG, palette=palette)
+    assert set(no_dither.get_flattened_data()) == {1}
+    assert set(dithered.get_flattened_data()) == {1, 2}
+    alpha_values = [
+        alpha for _, _, _, alpha in dithered.convert("RGBA").get_flattened_data()
+    ]
+    assert set(alpha_values) == {255}
+
+
+def test_quantize_rgba_palette_png_roundtrip() -> None:
+    palette = Image.new("P", (1, 1))
+    palette.putpalette(
+        (255, 0, 0, 0, 255, 0, 0, 128, 255, 0, 0, 255, 0, 0, 255, 0),
+        "RGBA",
+    )
+    source = Image.new("RGBA", (4, 1))
+    source.putdata(
+        [
+            (0, 0, 255, 0),
+            (254, 1, 1, 127),
+            (254, 1, 1, 200),
+            (0, 0, 255, 0),
+        ]
+    )
+
+    converted = source.quantize(dither=Image.Dither.NONE, palette=palette)
+    with BytesIO() as buffer:
+        converted.save(buffer, "PNG")
+        buffer.seek(0)
+        with Image.open(buffer) as reloaded:
+            assert reloaded.mode == "P"
+            assert "transparency" in reloaded.info
+            assert list(reloaded.convert("RGBA").get_flattened_data()) == [
+                (255, 0, 0, 0),
+                (255, 0, 0, 128),
+                (255, 0, 0, 255),
+                (255, 0, 0, 0),
+            ]
+
+
+def test_quantize_invalid_palette_mode() -> None:
+    source = Image.new("RGBA", (1, 1), (255, 0, 0, 255))
+    with pytest.raises(ValueError, match="bad mode for palette image"):
+        source.quantize(palette=Image.new("RGB", (1, 1)))
 
 
 def test_quantize_dither_diff() -> None:

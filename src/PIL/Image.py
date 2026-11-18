@@ -1297,8 +1297,10 @@ class Image:
                        and :data:`Quantize.MAXCOVERAGE` do not support RGBA images, so
                        :data:`Quantize.FASTOCTREE` is used by default instead.
         :param kmeans: Integer greater than or equal to zero.
-        :param palette: Quantize to the palette of given
-                        :py:class:`PIL.Image.Image`.
+        :param palette: Quantize to the palette of given P mode
+                        :py:class:`PIL.Image.Image`. For RGBA images, the
+                        palette's colors and alpha values are used when
+                        selecting the nearest color.
         :param dither: Dithering method, used when converting from
            mode "RGB" to "P" or from "RGB" or "L" to "1".
            Available methods are :data:`Dither.NONE` or :data:`Dither.FLOYDSTEINBERG`
@@ -1314,7 +1316,7 @@ class Image:
             if self.mode == "RGBA":
                 method = Quantize.FASTOCTREE
 
-        if self.mode == "RGBA" and method not in (
+        if self.mode == "RGBA" and palette is None and method not in (
             Quantize.FASTOCTREE,
             Quantize.LIBIMAGEQUANT,
         ):
@@ -1331,13 +1333,18 @@ class Image:
             if palette.mode != "P":
                 msg = "bad mode for palette image"
                 raise ValueError(msg)
-            if self.mode not in {"RGB", "L"}:
-                msg = "only RGB or L mode images can be quantized to a palette"
+            if self.mode not in {"RGB", "L", "RGBA"}:
+                msg = "only RGB, L or RGBA mode images can be quantized to a palette"
                 raise ValueError(msg)
-            im = self.im.convert("P", dither, palette.im)
+            mapping_palette = palette
+            if self.mode == "RGBA":
+                mapping_palette = palette.copy()
+                mapping_palette.apply_transparency()
+                mapping_palette.load()
+            im = self.im.convert("P", dither, mapping_palette.im)
             new_im = self._new(im)
-            assert palette.palette is not None
-            new_im.palette = palette.palette.copy()
+            assert mapping_palette.palette is not None
+            new_im.palette = mapping_palette.palette.copy()
             return new_im
 
         if kmeans < 0:
