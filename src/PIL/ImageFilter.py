@@ -178,6 +178,12 @@ class GaussianBlur(MultibandFilter):
     approximates a Gaussian kernel. For details on accuracy see
     <https://www.mia.uni-saarland.de/Publications/gwosdek-ssvm11.pdf>
 
+    In addition to the 8-bit modes, the unsigned 16-bit grayscale modes
+    ``"I;16"``, ``"I;16L"`` and ``"I;16B"`` are supported. The full
+    ``0`` to ``65535`` sample range is kept throughout the computation without
+    going through an 8-bit intermediate, and the output keeps the source mode,
+    size and byte order.
+
     :param radius: Standard deviation of the Gaussian kernel. Either a sequence of two
                    numbers for x and y, or a single number for both.
     """
@@ -203,11 +209,20 @@ class BoxBlur(MultibandFilter):
     which runs in linear time relative to the size of the image
     for any radius value.
 
+    In addition to the 8-bit modes, the unsigned 16-bit grayscale modes
+    ``"I;16"``, ``"I;16L"`` and ``"I;16B"`` are supported. The full
+    ``0`` to ``65535`` sample range is kept throughout the computation without
+    going through an 8-bit intermediate, and the output keeps the source mode,
+    size and byte order. Pixels outside the image are handled by extending the
+    edge pixels, as for the 8-bit filters.
+
     :param radius: Size of the box in a direction. Either a sequence of two numbers for
                    x and y, or a single number for both.
 
                    Radius 0 does not blur, returns an identical image.
                    Radius 1 takes 1 pixel in each direction, i.e. 9 pixels in total.
+
+                   A radius of ``nan`` or infinity raises :py:exc:`ValueError`.
     """
 
     name = "BoxBlur"

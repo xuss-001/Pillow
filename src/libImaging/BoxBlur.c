@@ -168,6 +168,72 @@ void static inline ImagingLineBoxBlur8(
 #undef SAVE
 }
 
+void static inline ImagingLineBoxBlur16(
+    UINT16 *lineOut,
+    const UINT16 *lineIn,
+    int lastx,
+    int radius,
+    int edgeA,
+    int edgeB,
+    UINT32 ww,
+    UINT32 fw
+) {
+    int x;
+    uint64_t acc;
+    uint64_t bulk;
+
+#define MOVE_ACC16(acc, subtract, add) acc += lineIn[add] - lineIn[subtract];
+
+#define ADD_FAR16(bulk, acc, left, right) \
+    bulk = (acc * (uint64_t)ww) + (((uint64_t)lineIn[left] + lineIn[right]) * fw);
+
+#define SAVE16(x, bulk) lineOut[x] = (UINT16)((bulk + (1 << 23)) >> 24)
+
+    acc = (uint64_t)lineIn[0] * (radius + 1);
+    for (x = 0; x < edgeA - 1; x++) {
+        acc += lineIn[x];
+    }
+    acc += (uint64_t)lineIn[lastx] * (radius - edgeA + 1);
+
+    if (edgeA <= edgeB) {
+        for (x = 0; x < edgeA; x++) {
+            MOVE_ACC16(acc, 0, x + radius);
+            ADD_FAR16(bulk, acc, 0, x + radius + 1);
+            SAVE16(x, bulk);
+        }
+        for (x = edgeA; x < edgeB; x++) {
+            MOVE_ACC16(acc, x - radius - 1, x + radius);
+            ADD_FAR16(bulk, acc, x - radius - 1, x + radius + 1);
+            SAVE16(x, bulk);
+        }
+        for (x = edgeB; x <= lastx; x++) {
+            MOVE_ACC16(acc, x - radius - 1, lastx);
+            ADD_FAR16(bulk, acc, x - radius - 1, lastx);
+            SAVE16(x, bulk);
+        }
+    } else {
+        for (x = 0; x < edgeB; x++) {
+            MOVE_ACC16(acc, 0, x + radius);
+            ADD_FAR16(bulk, acc, 0, x + radius + 1);
+            SAVE16(x, bulk);
+        }
+        for (x = edgeB; x < edgeA; x++) {
+            MOVE_ACC16(acc, 0, lastx);
+            ADD_FAR16(bulk, acc, 0, lastx);
+            SAVE16(x, bulk);
+        }
+        for (x = edgeA; x <= lastx; x++) {
+            MOVE_ACC16(acc, x - radius - 1, lastx);
+            ADD_FAR16(bulk, acc, x - radius - 1, lastx);
+            SAVE16(x, bulk);
+        }
+    }
+
+#undef MOVE_ACC16
+#undef ADD_FAR16
+#undef SAVE16
+}
+
 Imaging
 ImagingHorizontalBoxBlur(Imaging imOut, Imaging imIn, float floatRadius) {
     ImagingSectionCookie cookie;
@@ -181,16 +247,84 @@ ImagingHorizontalBoxBlur(Imaging imOut, Imaging imIn, float floatRadius) {
     int edgeA = MIN(radius + 1, imIn->xsize);
     int edgeB = MAX(imIn->xsize - radius - 1, 0);
 
-    UINT32 *lineOut = calloc(imIn->xsize, sizeof(UINT32));
+    int is16 = isModeI16(imIn->mode);
+    /* "I;16" and "I;16L" store little-endian samples, "I;16B" big-endian. */
+    int swap = (imIn->mode == IMAGING_MODE_I_16B);
+    void *lineOut = NULL;
+    if (is16) {
+        lineOut = calloc(imIn->xsize, sizeof(UINT16));
+    } else {
+        lineOut = calloc(imIn->xsize, sizeof(UINT32));
+    }
     if (lineOut == NULL) {
         return ImagingError_MemoryError();
+    }
+    UINT16 *line16In = NULL;
+    if (is16 && swap) {
+        line16In = calloc(imIn->xsize, sizeof(UINT16));
+        if (line16In == NULL) {
+            free(lineOut);
+            return ImagingError_MemoryError();
+        }
     }
 
     // printf(">>> %d %d %d\n", radius, ww, fw);
 
     ImagingSectionEnter(&cookie);
 
-    if (imIn->image8) {
+    if (is16) {
+        UINT16 *line16 = (UINT16 *)lineOut;
+        for (y = 0; y < imIn->ysize; y++) {
+            const UINT8 *rowIn = imIn->image8[y];
+            UINT8 *rowOut = imOut->image8[y];
+            int x;
+            if (!swap) {
+                if (imIn == imOut) {
+                    ImagingLineBoxBlur16(
+                        line16,
+                        (const UINT16 *)rowIn,
+                        imIn->xsize - 1,
+                        radius,
+                        edgeA,
+                        edgeB,
+                        ww,
+                        fw
+                    );
+                    // Commit.
+                    memcpy(rowOut, line16, imIn->xsize * sizeof(UINT16));
+                } else {
+                    ImagingLineBoxBlur16(
+                        (UINT16 *)rowOut,
+                        (const UINT16 *)rowIn,
+                        imIn->xsize - 1,
+                        radius,
+                        edgeA,
+                        edgeB,
+                        ww,
+                        fw
+                    );
+                }
+            } else {
+                for (x = 0; x < imIn->xsize; x++) {
+                    line16In[x] = (UINT16)rowIn[x * 2] << 8 | rowIn[x * 2 + 1];
+                }
+                ImagingLineBoxBlur16(
+                    line16,
+                    line16In,
+                    imIn->xsize - 1,
+                    radius,
+                    edgeA,
+                    edgeB,
+                    ww,
+                    fw
+                );
+                for (x = 0; x < imIn->xsize; x++) {
+                    rowOut[x * 2] = (UINT8)(line16[x] >> 8);
+                    rowOut[x * 2 + 1] = (UINT8)line16[x];
+                }
+            }
+        }
+    } else if (imIn->image8) {
         for (y = 0; y < imIn->ysize; y++) {
             ImagingLineBoxBlur8(
                 (imIn == imOut ? (UINT8 *)lineOut : imOut->image8[y]),
@@ -228,6 +362,7 @@ ImagingHorizontalBoxBlur(Imaging imOut, Imaging imIn, float floatRadius) {
 
     ImagingSectionLeave(&cookie);
 
+    free(line16In);
     free(lineOut);
 
     return imOut;
@@ -254,15 +389,24 @@ ImagingBoxBlur(Imaging imOut, Imaging imIn, float xradius, float yradius, int n)
         return ImagingError_Mismatch();
     }
 
-    if (imIn->type != IMAGING_TYPE_UINT8) {
-        return ImagingError_ModeError();
-    }
+    if (isModeI16(imIn->mode) &&
+        (imIn->mode == IMAGING_MODE_I_16 || imIn->mode == IMAGING_MODE_I_16L ||
+         imIn->mode == IMAGING_MODE_I_16B)) {
+        /* Unsigned 16-bit grayscale, values in the 0..65535 range. */
+        if (!isfinite(xradius) || !isfinite(yradius)) {
+            return ImagingError_ValueError("radius must be finite");
+        }
+    } else {
+        if (imIn->type != IMAGING_TYPE_UINT8) {
+            return ImagingError_ModeError();
+        }
 
-    if (imIn->mode != IMAGING_MODE_RGB && imIn->mode != IMAGING_MODE_RGBA &&
-        imIn->mode != IMAGING_MODE_RGBa && imIn->mode != IMAGING_MODE_RGBX &&
-        imIn->mode != IMAGING_MODE_CMYK && imIn->mode != IMAGING_MODE_L &&
-        imIn->mode != IMAGING_MODE_LA && imIn->mode != IMAGING_MODE_La) {
-        return ImagingError_ModeError();
+        if (imIn->mode != IMAGING_MODE_RGB && imIn->mode != IMAGING_MODE_RGBA &&
+            imIn->mode != IMAGING_MODE_RGBa && imIn->mode != IMAGING_MODE_RGBX &&
+            imIn->mode != IMAGING_MODE_CMYK && imIn->mode != IMAGING_MODE_L &&
+            imIn->mode != IMAGING_MODE_LA && imIn->mode != IMAGING_MODE_La) {
+            return ImagingError_ModeError();
+        }
     }
 
     /* Apply blur in one dimension.

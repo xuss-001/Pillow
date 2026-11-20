@@ -35,6 +35,14 @@ ImagingUnsharpMask(
     UINT8 *lineIn8 = NULL;
     UINT8 *lineOut8 = NULL;
 
+    /* The sharpening pass below only understands the 8-bit and 32-bit
+       interleaved layouts. Unsigned 16-bit grayscale modes share the
+       image8 pointer but store two bytes per sample, so reject them here
+       rather than reading the raster with the wrong pixel size. */
+    if (imIn->type != IMAGING_TYPE_UINT8) {
+        return ImagingError_ModeError();
+    }
+
     /* First, do a gaussian blur on the image, putting results in imOut
        temporarily. All format checks are in gaussian blur. */
     result = ImagingGaussianBlur(imOut, imIn, radius, radius, 3);
