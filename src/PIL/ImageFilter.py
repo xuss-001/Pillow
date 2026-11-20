@@ -18,6 +18,8 @@ from __future__ import annotations
 
 import abc
 import functools
+import math
+import os
 from collections.abc import Sequence
 from typing import cast
 
@@ -25,7 +27,7 @@ TYPE_CHECKING = False
 if TYPE_CHECKING:
     from collections.abc import Callable
     from types import ModuleType
-    from typing import Any
+    from typing import Any, TextIO
 
     from . import _imaging
     from ._typing import NumpyArray
@@ -484,6 +486,17 @@ class Color3DLUT(MultibandFilter):
         return size
 
     @classmethod
+    def from_cube(
+        cls, source: str | os.PathLike[str] | TextIO
+    ) -> CubeLUT:
+        """Creates a ``CubeLUT`` from a ``.cube`` file path or text stream.
+
+        This is an alternative to constructing :class:`CubeLUT` directly.
+        """
+
+        return CubeLUT(source)
+
+    @classmethod
     def generate(
         cls,
         size: int | tuple[int, int, int],
@@ -605,3 +618,349 @@ class Color3DLUT(MultibandFilter):
             self.size,
             self.table,
         )
+
+
+class CubeLUT(MultibandFilter):
+    """Three-dimensional color lookup table loaded from a ``.cube`` file.
+
+    The table is read according to the Cube LUT Specification 1.0. ``TITLE``,
+    ``LUT_3D_SIZE``, ``DOMAIN_MIN``, ``DOMAIN_MAX``, comments and scientific
+    notation are supported. Data rows are ordered with the red axis changing
+    fastest and the blue axis changing slowest.
+
+    Colors are mapped from the input domain to the table and interpolated with
+    tetrahedral interpolation. Values outside the input domain are clamped to
+    its nearest endpoint. Table values are not clipped before interpolation;
+    the interpolated result is clamped to the 8-bit output range afterwards.
+
+    Applying this filter to an ``RGB`` or ``RGBA`` image returns a new image.
+    The alpha channel of ``RGBA`` images is copied unchanged. No color space
+    conversion is performed.
+
+    Only 3D LUTs are supported. 1D LUTs and combined 1D/3D LUTs raise
+    :exc:`ValueError`.
+
+    :param source: A path to a ``.cube`` file, or an open text stream. The
+                   stream is read from its current position and is not closed.
+    """
+
+    name = "Cube LUT"
+    channels = 3
+
+    def __init__(
+        self,
+        source: str | os.PathLike[str] | TextIO,
+    ) -> None:
+        title, size, domain_min, domain_max, table = self._parse(source)
+        self.title = title
+        self.size = size
+        self.domain_min = domain_min
+        self.domain_max = domain_max
+        self.table = table
+        self._axis_lookup = tuple(
+            self._make_axis_lookup(domain_min[channel], domain_max[channel], size)
+            for channel in range(3)
+        )
+
+    @staticmethod
+    def _strip_comment(line: str) -> str:
+        quoted = False
+        escaped = False
+        for index, char in enumerate(line):
+            if escaped:
+                escaped = False
+            elif quoted and char == "\\":
+                escaped = True
+            elif char == '"':
+                quoted = not quoted
+            elif char == "#" and not quoted:
+                return line[:index]
+        return line
+
+    @staticmethod
+    def _parse_vector(
+        values: list[str], keyword: str, line_number: int
+    ) -> tuple[float, float, float]:
+        if len(values) != 3:
+            msg = (
+                f"{keyword} on line {line_number} should have exactly "
+                "three numeric values"
+            )
+            raise ValueError(msg)
+        result = []
+        for value in values:
+            try:
+                number = float(value)
+            except ValueError as e:
+                msg = f"Invalid {keyword} value on line {line_number}: {value!r}"
+                raise ValueError(msg) from e
+            if not math.isfinite(number):
+                msg = f"{keyword} values on line {line_number} must be finite"
+                raise ValueError(msg)
+            result.append(number)
+        return cast(tuple[float, float, float], tuple(result))
+
+    @classmethod
+    def _parse(
+        cls, source: str | os.PathLike[str] | TextIO
+    ) -> tuple[
+        str | None,
+        tuple[int, int, int],
+        tuple[float, float, float],
+        tuple[float, float, float],
+        list[float],
+    ]:
+        if isinstance(source, (str, os.PathLike)):
+            with open(source, encoding="utf-8-sig") as stream:
+                text = stream.read()
+        else:
+            read = getattr(source, "read", None)
+            if read is None:
+                msg = "source should be a path or an open text stream"
+                raise TypeError(msg)
+            text = read()
+            if not isinstance(text, str):
+                msg = "source text stream should return str from read()"
+                raise TypeError(msg)
+
+        title: str | None = None
+        size_value: int | None = None
+        domain_min: tuple[float, float, float] | None = None
+        domain_max: tuple[float, float, float] | None = None
+        table: list[float] = []
+        seen: set[str] = set()
+
+        for line_number, raw_line in enumerate(text.splitlines(), 1):
+            line = cls._strip_comment(raw_line).strip().lstrip("\ufeff")
+            if not line:
+                continue
+
+            parts = line.split()
+            keyword = parts[0].upper()
+            if keyword in ("LUT_1D_SIZE", "LUT_1D_INPUT_RANGE"):
+                msg = (
+                    f"{keyword} on line {line_number}: 1D LUTs and combined "
+                    "1D/3D LUTs are not supported"
+                )
+                raise ValueError(msg)
+            if keyword == "LUT_3D_SIZE":
+                if "LUT_3D_SIZE" in seen:
+                    msg = f"Duplicate LUT_3D_SIZE definition on line {line_number}"
+                    raise ValueError(msg)
+                if len(parts) != 2:
+                    msg = (
+                        f"LUT_3D_SIZE on line {line_number} should have exactly "
+                        "one integer value"
+                    )
+                    raise ValueError(msg)
+                try:
+                    size_value = int(parts[1], 10)
+                except ValueError as e:
+                    msg = (
+                        f"Invalid LUT_3D_SIZE value on line {line_number}: "
+                        f"{parts[1]!r}"
+                    )
+                    raise ValueError(msg) from e
+                if not 2 <= size_value <= 65:
+                    msg = (
+                        "LUT_3D_SIZE should be in [2, 65] range "
+                        f"on line {line_number}"
+                    )
+                    raise ValueError(msg)
+                seen.add("LUT_3D_SIZE")
+            elif keyword in ("DOMAIN_MIN", "DOMAIN_MAX"):
+                if keyword in seen:
+                    msg = f"Duplicate {keyword} definition on line {line_number}"
+                    raise ValueError(msg)
+                vector = cls._parse_vector(parts[1:], keyword, line_number)
+                if keyword == "DOMAIN_MIN":
+                    domain_min = vector
+                else:
+                    domain_max = vector
+                seen.add(keyword)
+            elif keyword == "TITLE":
+                if "TITLE" in seen:
+                    msg = f"Duplicate TITLE definition on line {line_number}"
+                    raise ValueError(msg)
+                title_part = line[len(parts[0]) :].strip()
+                if not title_part:
+                    msg = f"TITLE on line {line_number} should not be empty"
+                    raise ValueError(msg)
+                if title_part.startswith('"') or title_part.endswith('"'):
+                    if not (title_part.startswith('"') and title_part.endswith('"')):
+                        msg = f"Unterminated TITLE on line {line_number}"
+                        raise ValueError(msg)
+                    title = title_part[1:-1]
+                else:
+                    title = title_part
+                seen.add("TITLE")
+            elif keyword.startswith("LUT_"):
+                msg = f"Unsupported directive {parts[0]} on line {line_number}"
+                raise ValueError(msg)
+            else:
+                if len(parts) != 3:
+                    msg = (
+                        f"Expected three table values on line {line_number}, "
+                        f"found {len(parts)}"
+                    )
+                    raise ValueError(msg)
+                for value in parts:
+                    try:
+                        number = float(value)
+                    except ValueError as e:
+                        msg = (
+                            f"Invalid table value on line {line_number}: "
+                            f"{value!r}"
+                        )
+                        raise ValueError(msg) from e
+                    if not math.isfinite(number):
+                        msg = (
+                            f"Table values on line {line_number} must be finite"
+                        )
+                        raise ValueError(msg)
+                    table.append(number)
+
+        if size_value is None:
+            msg = "LUT_3D_SIZE is required"
+            raise ValueError(msg)
+
+        domain_min = domain_min or (0.0, 0.0, 0.0)
+        domain_max = domain_max or (1.0, 1.0, 1.0)
+        for channel, (minimum, maximum) in enumerate(zip(domain_min, domain_max)):
+            if minimum >= maximum:
+                msg = (
+                    f"Invalid input domain for channel {channel}: "
+                    f"DOMAIN_MIN must be less than DOMAIN_MAX"
+                )
+                raise ValueError(msg)
+
+        expected_values = size_value**3 * 3
+        if len(table) != expected_values:
+            msg = (
+                "Table data does not match LUT_3D_SIZE: "
+                f"expected {expected_values // 3} rows, found {len(table) // 3}"
+            )
+            raise ValueError(msg)
+
+        size = (size_value, size_value, size_value)
+        return title, size, domain_min, domain_max, table
+
+    @staticmethod
+    def _make_axis_lookup(
+        domain_min: float, domain_max: float, size: tuple[int, int, int]
+    ) -> tuple[tuple[int, float], ...]:
+        grid_size = size[0] - 1
+        scale = 1 / (domain_max - domain_min)
+        lookup = []
+        for value in range(256):
+            normalized = (value / 255 - domain_min) * scale
+            normalized = min(1.0, max(0.0, normalized))
+            position = normalized * grid_size
+            index = int(position)
+            if index >= grid_size:
+                index = grid_size - 1
+                fraction = 1.0
+            else:
+                fraction = position - index
+            lookup.append((index, fraction))
+        return tuple(lookup)
+
+    def __repr__(self) -> str:
+        result = [
+            f"{self.__class__.__name__}",
+            "size={:d}x{:d}x{:d}".format(*self.size),
+        ]
+        if self.title is not None:
+            result.append(f"title={self.title!r}")
+        return "<{}>".format(" ".join(result))
+
+    def filter(self, image: _imaging.ImagingCore) -> _imaging.ImagingCore:
+        from . import Image
+
+        if image.mode not in ("RGB", "RGBA"):
+            msg = "CubeLUT supports only RGB and RGBA images"
+            raise ValueError(msg)
+
+        source = Image.Image()._new(image)
+        input_data = source.tobytes()
+        output_data = bytearray(input_data)
+        stride = 4 if image.mode == "RGBA" else 3
+
+        size_1d, size_2d, size_3d = self.size
+        size_1d_2d = size_1d * size_2d
+        channel_stride = 3
+        offset_1d = channel_stride
+        offset_2d = size_1d * channel_stride
+        offset_3d = size_1d_2d * channel_stride
+        corner_offset = offset_1d + offset_2d + offset_3d
+
+        lookup_1d, lookup_2d, lookup_3d = self._axis_lookup
+        table = self.table
+
+        for pixel_index in range(0, len(input_data), stride):
+            index_1d, fraction_1d = lookup_1d[input_data[pixel_index]]
+            index_2d, fraction_2d = lookup_2d[input_data[pixel_index + 1]]
+            index_3d, fraction_3d = lookup_3d[input_data[pixel_index + 2]]
+            base = (
+                index_3d * offset_3d + index_2d * offset_2d + index_1d * offset_1d
+            )
+
+            if fraction_1d >= fraction_2d:
+                if fraction_2d >= fraction_3d:
+                    highest = fraction_1d
+                    middle = fraction_2d
+                    lowest = fraction_3d
+                    offset_a = offset_1d
+                    offset_b = offset_1d + offset_2d
+                elif fraction_1d >= fraction_3d:
+                    highest = fraction_1d
+                    middle = fraction_3d
+                    lowest = fraction_2d
+                    offset_a = offset_1d
+                    offset_b = offset_1d + offset_3d
+                else:
+                    highest = fraction_3d
+                    middle = fraction_1d
+                    lowest = fraction_2d
+                    offset_a = offset_3d
+                    offset_b = offset_1d + offset_3d
+            elif fraction_3d >= fraction_2d:
+                highest = fraction_3d
+                middle = fraction_2d
+                lowest = fraction_1d
+                offset_a = offset_3d
+                offset_b = offset_2d + offset_3d
+            elif fraction_3d >= fraction_1d:
+                highest = fraction_2d
+                middle = fraction_3d
+                lowest = fraction_1d
+                offset_a = offset_2d
+                offset_b = offset_2d + offset_3d
+            else:
+                highest = fraction_2d
+                middle = fraction_1d
+                lowest = fraction_3d
+                offset_a = offset_2d
+                offset_b = offset_1d + offset_2d
+
+            weight_0 = 1 - highest
+            weight_a = highest - middle
+            weight_b = middle - lowest
+            weight_c = lowest
+
+            for channel in range(3):
+                value_0 = table[base + channel]
+                value_a = table[base + offset_a + channel]
+                value_b = table[base + offset_b + channel]
+                value_c = table[base + corner_offset + channel]
+                value = (
+                    value_0 * weight_0
+                    + value_a * weight_a
+                    + value_b * weight_b
+                    + value_c * weight_c
+                )
+                output_data[pixel_index + channel] = min(
+                    255, max(0, int(value * 255 + 0.5))
+                )
+
+        return Image.frombytes(image.mode, image.size, bytes(output_data)).im
