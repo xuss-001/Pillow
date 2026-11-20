@@ -907,7 +907,11 @@ class PngImageFile(ImageFile.ImageFile):
 
             if self.dispose:
                 self.im.paste(self.dispose, self.dispose_extent)
-            self._prev_im = self.im.copy()
+            if self.__frame == 0 and self.default_image:
+                # The default image is not part of the animation.
+                self._prev_im = None
+            else:
+                self._prev_im = self.im.copy()
 
             self.fp = self._fp
 
@@ -1069,7 +1073,10 @@ class PngImageFile(ImageFile.ImageFile):
         else:
             if self._prev_im and self.blend_op == Blend.OP_OVER:
                 updated = self._crop(self.im, self.dispose_extent)
-                if self.im.mode == "RGB" and "transparency" in self.info:
+                if self.im.mode == "RGBA":
+                    previous = self._crop(self._prev_im, self.dispose_extent)
+                    updated = Image.core.alpha_composite(previous, updated)
+                elif self.im.mode == "RGB" and "transparency" in self.info:
                     mask = updated.convert_transparent(
                         "RGBA", self.info["transparency"]
                     )
@@ -1081,7 +1088,10 @@ class PngImageFile(ImageFile.ImageFile):
                         elif isinstance(t, int):
                             updated.putpalettealpha(t)
                     mask = updated.convert("RGBA")
-                self._prev_im.paste(updated, self.dispose_extent, mask)
+                if self.im.mode == "RGBA":
+                    self._prev_im.paste(updated, self.dispose_extent)
+                else:
+                    self._prev_im.paste(updated, self.dispose_extent, mask)
                 self.im = self._prev_im
 
     def _getexif(self) -> dict[int, Any] | None:
@@ -1177,6 +1187,7 @@ def _write_multiple_frames(
     chunk: Callable[..., None],
     mode: str,
     rawmode: str,
+    size: tuple[int, int],
     default_image: Image.Image | None,
     append_images: list[Image.Image],
 ) -> Image.Image | None:
@@ -1191,6 +1202,7 @@ def _write_multiple_frames(
         chain = itertools.chain([im], append_images)
 
     im_frames: list[_Frame] = []
+    canvas = Image.new("RGBA", size, (0, 0, 0, 0))
     frame_count = 0
     for im_seq in chain:
         for im_frame in ImageSequence.Iterator(im_seq):
@@ -1209,41 +1221,48 @@ def _write_multiple_frames(
                 encoderinfo["blend"] = blend[frame_count]
             frame_count += 1
 
-            if im_frames:
-                previous = im_frames[-1]
-                prev_disposal = previous.encoderinfo.get("disposal")
-                prev_blend = previous.encoderinfo.get("blend")
-                if prev_disposal == Disposal.OP_PREVIOUS and len(im_frames) < 2:
-                    prev_disposal = Disposal.OP_BACKGROUND
+            frame_disposal = encoderinfo.get("disposal", disposal)
+            frame_blend = encoderinfo.get("blend", blend)
+            before = canvas
+            canvas = before.copy()
+            rgba_frame = im_frame.convert("RGBA")
+            if frame_blend == Blend.OP_OVER:
+                canvas.alpha_composite(rgba_frame)
+            else:
+                canvas.paste(rgba_frame, (0, 0))
 
-                if prev_disposal == Disposal.OP_BACKGROUND:
-                    base_im = previous.im.copy()
-                    dispose = Image.core.fill("RGBA", im.size, (0, 0, 0, 0))
-                    bbox = previous.bbox
-                    if bbox:
-                        dispose = dispose.crop(bbox)
-                    else:
-                        bbox = (0, 0) + im.size
-                    base_im.paste(dispose, bbox)
-                elif prev_disposal == Disposal.OP_PREVIOUS:
-                    base_im = im_frames[-2].im
-                else:
-                    base_im = previous.im
-                delta = ImageChops.subtract_modulo(
-                    im_frame.convert("RGBA"), base_im.convert("RGBA")
-                )
-                bbox = delta.getbbox(alpha_only=False)
+            bbox = ImageChops.difference(before, canvas).getbbox(alpha_only=False)
+            if im_frames and not bbox:
+                previous = im_frames[-1]
+                prev_disposal = previous.encoderinfo.get("disposal", disposal)
+                prev_blend = previous.encoderinfo.get("blend", blend)
                 if (
-                    not bbox
-                    and prev_disposal == encoderinfo.get("disposal")
-                    and prev_blend == encoderinfo.get("blend")
+                    prev_disposal == Disposal.OP_NONE
+                    and prev_disposal == frame_disposal
+                    and prev_blend == frame_blend
                     and "duration" in encoderinfo
                 ):
-                    previous.encoderinfo["duration"] += encoderinfo["duration"]
+                    previous.encoderinfo["duration"] = previous.encoderinfo.get(
+                        "duration", 0
+                    ) + encoderinfo["duration"]
+                    canvas = before
                     continue
-            else:
-                bbox = None
+
+            if not im_frames:
+                # The first animation frame is the IDAT image and must cover
+                # the logical screen.
+                bbox = (0, 0) + im_frame.size
+            elif not bbox:
+                # There is no visible change, but the frame still needs to
+                # represent its duration and disposal operation.
+                bbox = (0, 0) + im_frame.size
+
             im_frames.append(_Frame(im_frame, bbox, encoderinfo))
+
+            if frame_disposal == Disposal.OP_BACKGROUND:
+                canvas.paste((0, 0, 0, 0), bbox)
+            elif frame_disposal == Disposal.OP_PREVIOUS:
+                canvas.paste(before.crop(bbox), bbox)
 
     if len(im_frames) == 1 and not default_image:
         return im_frames[0].im
@@ -1500,7 +1519,7 @@ def _save(
     single_im: Image.Image | None = im
     if save_all:
         single_im = _write_multiple_frames(
-            im, fp, chunk, mode, rawmode, default_image, append_images
+            im, fp, chunk, mode, rawmode, size, default_image, append_images
         )
     if single_im:
         _apply_encoderinfo(single_im, im.encoderinfo)

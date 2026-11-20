@@ -1,11 +1,108 @@
 from __future__ import annotations
 
+import struct
+import zlib
 from io import BytesIO
 from pathlib import Path
+from typing import TypedDict
 
 import pytest
 
 from PIL import Image, ImageSequence, PngImagePlugin
+
+
+class _APNGFrame(TypedDict, total=False):
+    image: Image.Image
+    bbox: tuple[int, int, int, int]
+    duration: int
+    disposal: int
+    blend: int
+
+
+def _chunk(cid: bytes, data: bytes) -> bytes:
+    return (
+        struct.pack(">I", len(data))
+        + cid
+        + data
+        + struct.pack(">I", zlib.crc32(cid + data) & 0xFFFFFFFF)
+    )
+
+
+def _make_apng(
+    frames: list[_APNGFrame],
+    size: tuple[int, int],
+    default_image: Image.Image | None = None,
+) -> bytes:
+    data = b"\x89PNG\r\n\x1a\n"
+    data += _chunk(b"IHDR", struct.pack(">IIBBBBB", size[0], size[1], 8, 6, 0, 0, 0))
+    data += _chunk(b"acTL", struct.pack(">II", len(frames), 0))
+
+    seq_num = 0
+    if default_image:
+        width, height = default_image.size
+        default_raw = b"".join(
+            b"\0" + default_image.tobytes()[row * width * 4 : (row + 1) * width * 4]
+            for row in range(height)
+        )
+        data += _chunk(b"IDAT", zlib.compress(default_raw))
+
+    for frame_index, frame in enumerate(frames):
+        image = frame["image"]
+        bbox = frame.get("bbox", (0, 0) + image.size)
+        x, y, right, bottom = bbox
+        width, height = right - x, bottom - y
+        duration = frame.get("duration", 100)
+        disposal = frame.get("disposal", PngImagePlugin.Disposal.OP_NONE)
+        blend = frame.get("blend", PngImagePlugin.Blend.OP_SOURCE)
+
+        data += _chunk(
+            b"fcTL",
+            struct.pack(
+                ">IIIIIHHBB",
+                seq_num,
+                width,
+                height,
+                x,
+                y,
+                duration,
+                1000,
+                disposal,
+                blend,
+            ),
+        )
+        seq_num += 1
+
+        raw = b"".join(
+            b"\0" + image.tobytes()[row * width * 4 : (row + 1) * width * 4]
+            for row in range(height)
+        )
+        compressed = zlib.compress(raw)
+        if frame_index == 0 and default_image is None:
+            data += _chunk(b"IDAT", compressed)
+        else:
+            data += _chunk(b"fdAT", struct.pack(">I", seq_num) + compressed)
+            seq_num += 1
+
+    return data + _chunk(b"IEND", b"")
+
+
+def _get_chunks(data: bytes) -> list[tuple[bytes, bytes]]:
+    chunks: list[tuple[bytes, bytes]] = []
+    pos = 8
+    while pos < len(data):
+        length = struct.unpack(">I", data[pos : pos + 4])[0]
+        cid = data[pos + 4 : pos + 8]
+        chunks.append((cid, data[pos + 8 : pos + 8 + length]))
+        pos += length + 12
+    return chunks
+
+
+def _get_fctl(data: bytes) -> list[tuple[int, ...]]:
+    return [
+        struct.unpack(">IIIIIHHBB", chunk)
+        for cid, chunk in _get_chunks(data)
+        if cid == b"fcTL"
+    ]
 
 
 # APNG browser support tests and fixtures via:
@@ -186,7 +283,7 @@ def test_apng_blend() -> None:
     with Image.open("Tests/images/apng/blend_op_over_near_transparent.png") as im:
         assert isinstance(im, PngImagePlugin.PngImageFile)
         im.seek(im.n_frames - 1)
-        assert im.getpixel((0, 0)) == (0, 255, 0, 97)
+        assert im.getpixel((0, 0)) == (0, 255, 0, 255)
         assert im.getpixel((64, 32)) == (0, 255, 0, 255)
 
 
@@ -194,6 +291,121 @@ def test_apng_blend_transparency() -> None:
     with Image.open("Tests/images/blend_transparency.png") as im:
         im.seek(1)
         assert im.getpixel((0, 0)) == (255, 0, 0)
+
+
+@pytest.mark.parametrize("with_default_image", (False, True))
+@pytest.mark.parametrize(
+    "first_blend",
+    (PngImagePlugin.Blend.OP_SOURCE, PngImagePlugin.Blend.OP_OVER),
+)
+def test_apng_rgba_over_alpha_composite(
+    with_default_image: bool, first_blend: PngImagePlugin.Blend
+) -> None:
+    semi_transparent_red = Image.new("RGBA", (1, 1), (255, 0, 0, 128))
+    default_image = Image.new("RGBA", (1, 1), (0, 255, 0, 255))
+    frames = [
+        {
+            "image": semi_transparent_red.copy(),
+            "disposal": PngImagePlugin.Disposal.OP_NONE,
+            "blend": first_blend,
+        },
+        {
+            "image": semi_transparent_red.copy(),
+            "disposal": PngImagePlugin.Disposal.OP_NONE,
+            "blend": PngImagePlugin.Blend.OP_OVER,
+        },
+        {
+            "image": semi_transparent_red.copy(),
+            "disposal": PngImagePlugin.Disposal.OP_NONE,
+            "blend": PngImagePlugin.Blend.OP_OVER,
+        },
+    ]
+    data = _make_apng(
+        frames,
+        (1, 1),
+        default_image if with_default_image else None,
+    )
+
+    with Image.open(BytesIO(data)) as im:
+        assert im.n_frames == len(frames) + int(with_default_image)
+        offset = int(with_default_image)
+        if with_default_image:
+            assert im.getpixel((0, 0)) == (0, 255, 0, 255)
+
+        for index, alpha in enumerate((128, 192, 224)):
+            im.seek(offset + index)
+            assert im.getpixel((0, 0)) == (255, 0, 0, alpha)
+
+        # Seeking backwards and forwards must reproduce the same frames.
+        im.seek(offset)
+        assert im.getpixel((0, 0)) == (255, 0, 0, 128)
+        im.seek(offset + 2)
+        assert im.getpixel((0, 0)) == (255, 0, 0, 224)
+
+
+def test_apng_rgba_disposal_updates_canvas_state() -> None:
+    size = (4, 1)
+    red = Image.new("RGBA", size, (255, 0, 0, 255))
+    blue = Image.new("RGBA", (1, 1), (0, 0, 255, 255))
+    green = Image.new("RGBA", (1, 1), (0, 255, 0, 128))
+    frames = [
+        {
+            "image": red,
+            "disposal": PngImagePlugin.Disposal.OP_NONE,
+            "blend": PngImagePlugin.Blend.OP_SOURCE,
+        },
+        {
+            "image": blue,
+            "bbox": (1, 0, 2, 1),
+            "disposal": PngImagePlugin.Disposal.OP_PREVIOUS,
+            "blend": PngImagePlugin.Blend.OP_SOURCE,
+        },
+        {
+            "image": green,
+            "bbox": (1, 0, 2, 1),
+            "disposal": PngImagePlugin.Disposal.OP_BACKGROUND,
+            "blend": PngImagePlugin.Blend.OP_OVER,
+        },
+        {
+            "image": blue,
+            "bbox": (2, 0, 3, 1),
+            "disposal": PngImagePlugin.Disposal.OP_NONE,
+            "blend": PngImagePlugin.Blend.OP_SOURCE,
+        },
+    ]
+    data = _make_apng(frames, size)
+
+    with Image.open(BytesIO(data)) as im:
+        im.seek(1)
+        assert [im.getpixel((x, 0)) for x in range(4)] == [
+            (255, 0, 0, 255),
+            (0, 0, 255, 255),
+            (255, 0, 0, 255),
+            (255, 0, 0, 255),
+        ]
+
+        # OP_PREVIOUS restores the red pixel before OP_OVER is applied.
+        im.seek(2)
+        assert [im.getpixel((x, 0)) for x in range(4)] == [
+            (255, 0, 0, 255),
+            (127, 128, 0, 255),
+            (255, 0, 0, 255),
+            (255, 0, 0, 255),
+        ]
+
+        # OP_BACKGROUND clears only the previous frame's local region.
+        im.seek(3)
+        assert [im.getpixel((x, 0)) for x in range(4)] == [
+            (255, 0, 0, 255),
+            (0, 0, 0, 0),
+            (0, 0, 255, 255),
+            (255, 0, 0, 255),
+        ]
+
+        im.seek(2)
+        assert im.getpixel((1, 0)) == (127, 128, 0, 255)
+        im.seek(3)
+        assert im.getpixel((1, 0)) == (0, 0, 0, 0)
 
 
 def test_apng_chunk_order() -> None:
@@ -257,8 +469,8 @@ def test_apng_mode() -> None:
         assert isinstance(im, PngImagePlugin.PngImageFile)
         assert im.mode == "RGBA"
         im.seek(im.n_frames - 1)
-        assert im.getpixel((0, 0)) == (0, 0, 128, 191)
-        assert im.getpixel((64, 32)) == (0, 0, 128, 191)
+        assert im.getpixel((0, 0)) == (0, 0, 128, 255)
+        assert im.getpixel((64, 32)) == (0, 0, 128, 255)
 
     with Image.open("Tests/images/apng/mode_grayscale.png") as im:
         assert isinstance(im, PngImagePlugin.PngImageFile)
@@ -725,6 +937,139 @@ def test_apng_save_blend(tmp_path: Path) -> None:
     with Image.open(test_file) as im:
         im.seek(2)
         assert im.getpixel((0, 0)) == (0, 255, 0, 255)
+
+
+@pytest.mark.parametrize("with_default_image", (False, True))
+def test_apng_save_rgba_over_preserves_frames_and_durations(
+    with_default_image: bool,
+) -> None:
+    red = Image.new("RGBA", (2, 1), (255, 0, 0, 128))
+    cover = Image.new("RGBA", (2, 1), (0, 255, 0, 255))
+    if with_default_image:
+        base = cover
+        append_images = [red.copy(), red.copy(), red.copy()]
+    else:
+        base = red
+        append_images = [red.copy(), red.copy()]
+    original_frames = [
+        (image.tobytes(), image.info.copy()) for image in [base, *append_images]
+    ]
+    out = BytesIO()
+
+    base.save(
+        out,
+        "PNG",
+        save_all=True,
+        default_image=with_default_image,
+        append_images=append_images,
+        disposal=PngImagePlugin.Disposal.OP_NONE,
+        blend=[
+            PngImagePlugin.Blend.OP_SOURCE,
+            PngImagePlugin.Blend.OP_OVER,
+            PngImagePlugin.Blend.OP_OVER,
+        ],
+        duration=[100, 200, 300],
+    )
+    data = out.getvalue()
+
+    assert [
+        (image.tobytes(), image.info) for image in [base, *append_images]
+    ] == original_frames
+
+    fctl = _get_fctl(data)
+    assert len(fctl) == 3
+    assert [frame[7] for frame in fctl] == [0, 0, 0]
+    assert [frame[8] for frame in fctl] == [0, 1, 1]
+    assert [frame[5] / frame[6] * 1000 for frame in fctl] == [100, 200, 300]
+
+    with Image.open(BytesIO(data)) as im:
+        assert im.n_frames == 3 + int(with_default_image)
+        offset = int(with_default_image)
+        if with_default_image:
+            assert im.getpixel((0, 0)) == (0, 255, 0, 255)
+        total_duration = 0
+        for index, alpha in enumerate((128, 192, 224)):
+            im.seek(offset + index)
+            assert im.getpixel((0, 0)) == (255, 0, 0, alpha)
+            total_duration += im.info["duration"]
+        assert total_duration == 600
+
+        im.seek(offset)
+        assert im.getpixel((0, 0)) == (255, 0, 0, 128)
+        im.seek(offset + 2)
+        assert im.getpixel((0, 0)) == (255, 0, 0, 224)
+
+
+def test_apng_save_optimizes_disposal_regions() -> None:
+    size = (4, 1)
+
+    def patched(color: tuple[int, int, int, int]) -> Image.Image:
+        image = red.copy()
+        image.paste(Image.new("RGBA", (1, 1), color), (1, 0))
+        return image
+
+    red = Image.new("RGBA", size, (255, 0, 0, 255))
+    blue = patched((0, 0, 255, 255))
+    green = patched((0, 255, 0, 128))
+    cleared = patched((0, 0, 0, 0))
+    out = BytesIO()
+
+    red.save(
+        out,
+        "PNG",
+        save_all=True,
+        append_images=[blue, green, cleared],
+        disposal=[
+            PngImagePlugin.Disposal.OP_NONE,
+            PngImagePlugin.Disposal.OP_PREVIOUS,
+            PngImagePlugin.Disposal.OP_BACKGROUND,
+            PngImagePlugin.Disposal.OP_NONE,
+        ],
+        blend=[
+            PngImagePlugin.Blend.OP_SOURCE,
+            PngImagePlugin.Blend.OP_SOURCE,
+            PngImagePlugin.Blend.OP_OVER,
+            PngImagePlugin.Blend.OP_SOURCE,
+        ],
+        duration=[100, 100, 100, 100],
+    )
+    data = out.getvalue()
+
+    fctl = _get_fctl(data)
+    assert len(fctl) == 4
+    assert fctl[1][1:5] == (1, 1, 1, 0)
+    assert fctl[1][7:] == (
+        PngImagePlugin.Disposal.OP_PREVIOUS,
+        PngImagePlugin.Blend.OP_SOURCE,
+    )
+    assert fctl[2][1:5] == (1, 1, 1, 0)
+    assert fctl[2][7:] == (
+        PngImagePlugin.Disposal.OP_BACKGROUND,
+        PngImagePlugin.Blend.OP_OVER,
+    )
+
+    with Image.open(BytesIO(data)) as im:
+        assert im.n_frames == 4
+        assert sum(
+            frame.info["duration"] for frame in ImageSequence.Iterator(im)
+        ) == 400
+
+        im.seek(1)
+        assert [im.getpixel((x, 0)) for x in range(4)] == [
+            (255, 0, 0, 255),
+            (0, 0, 255, 255),
+            (255, 0, 0, 255),
+            (255, 0, 0, 255),
+        ]
+        im.seek(2)
+        assert im.getpixel((1, 0)) == (127, 128, 0, 255)
+        im.seek(3)
+        assert [im.getpixel((x, 0)) for x in range(4)] == [
+            (255, 0, 0, 255),
+            (0, 0, 0, 0),
+            (255, 0, 0, 255),
+            (255, 0, 0, 255),
+        ]
 
 
 def test_apng_save_size(tmp_path: Path) -> None:

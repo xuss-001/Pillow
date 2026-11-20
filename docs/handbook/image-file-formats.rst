@@ -999,6 +999,11 @@ where applicable:
     browser would render for this frame - the composite of all previous frames and this
     frame).
 
+    For RGBA images, ``OP_OVER`` performs source-over alpha compositing, so
+    repeated semi-transparent frames increase the resulting alpha channel. A
+    separate default image is not part of the animation and is not used as the
+    starting canvas for the first animation frame.
+
     Any APNG file containing sequence errors is treated as an invalid image. The APNG
     loader will not attempt to repair and reorder files containing sequence errors.
 
@@ -1058,6 +1063,15 @@ following parameters can also be set:
       image contents.
     * 1 (:py:data:`~PIL.PngImagePlugin.Blend.OP_OVER`) -
       This frame should be alpha composited with the previous output image contents.
+
+.. note::
+
+    When saving, Pillow may crop a frame to the region that changes the displayed
+    canvas, and may combine consecutive frames that have the same visual effect.
+    These optimizations account for the result of ``blend`` and ``disposal`` on
+    the canvas, including the state needed by later frames. Repeated
+    semi-transparent ``OP_OVER`` frames are therefore not discarded merely
+    because their source pixels are identical.
 
 .. note::
 
